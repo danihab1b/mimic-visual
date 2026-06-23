@@ -1,0 +1,812 @@
+# Mimic-Visual: Architecture Document
+
+> Clean-room implementation of a visual document retrieval and reconstruction system.
+> Inspired by the paradigm of PixelRAG but designed from first principles.
+
+---
+
+## 1. What It Is
+
+Mimic-Visual renders any document (web pages, PDFs, images) to screenshots, extracts text from both the **HTML source** and **OCR**, **fuses** both into a unified Structured Document Model (SDM), embeds the SDM for vector search, and can **reconstruct** the visual page from retrieved chunks.
+
+The core insight: **HTML and OCR are peers** — each compensates for the other's blind spots. HTML is perfect for DOM text but misses embedded image text and JS-rendered content. OCR catches everything visible but makes recognition errors. Fusion aligns both and picks the best text per region.
+
+---
+
+## 2. Core Primitives
+
+| Primitive | Definition |
+|---|---|
+| **Document** | Any renderable source — URL, PDF, image, local file |
+| **Render** | Screenshot tiles + metadata from a headless browser or renderer |
+| **HTML Source** | Raw markup fetched from the document (may be partial or absent) |
+| **OCR Pass** | Full text detection + recognition from the rendered image tiles |
+| **FusionBlock** | A text region containing: text, bbox, provenance (HTML or OCR or fused) |
+| **Structured Document Model (SDM)** | Complete page representation: ordered FusionBlocks + tables + images + layout |
+| **Chunk** | A page slice (e.g., 1024px) of the SDM — position + blocks in that viewport |
+| **Embedding** | Vector encoding of a Chunk (text-only, layout-aware, or hybrid) |
+| **Index** | FAISS store of chunk embeddings + sidecar metadata store for reconstruction |
+| **Reconstructor** | SDM → HTML / SVG / plain text re-rendering from fused data |
+
+---
+
+## 3. System Principles
+
+1. **Fusion is the core primitive** — alignment of HTML and OCR defines system quality
+2. **HTML and OCR are peers** — neither authoritative; both are fused by confidence
+3. **Provenance is never lost** — every block records its source(s) and confidence
+4. **Reconstructable by default** — the index stores enough data to rebuild any page
+5. **Pluggable at every layer** — OCR, embedder, reconstructor are abstract interfaces
+6. **CLI-first, library-second** — stages are independent CLI commands composing via files
+7. **Config-driven** — YAML configuration for every stage, sensible defaults throughout
+
+---
+
+## 4. High-Level Pipeline
+
+```
+                    ┌───────────────────┐
+                    │    Document        │
+                    │ (URL / PDF / file) │
+                    └────────┬──────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+              ▼                             ▼
+     ┌────────────────┐           ┌─────────────────┐
+     │   Render        │           │   HTML Source    │
+     │ (Playwright /   │           │ (raw markup /    │
+     │  CDP / MuPDF)   │           │  may be empty)   │
+     │                 │           │                  │
+     │ → JPEG tiles    │           │ → text node tree │
+     │ → tiles.json    │           │ → CSS styles     │
+     └────────┬───────┘           └────────┬─────────┘
+              │                             │
+              ▼                             │
+     ┌────────────────┐                    │
+     │  OCR Engine     │                    │
+     │ (Surya / DocTR /│                    │
+     │  EasyOCR)       │                    │
+     │                 │                    │
+     │ → text + bboxes │                    │
+     │ → reading order │                    │
+     │ → confidence    │                    │
+     └────────┬───────┘                    │
+              │                             │
+              └──────────┬──────────────────┘
+                         ▼
+              ┌──────────────────────────┐
+              │     FUSION ENGINE         │
+              │                           │
+              │ 1. Needleman-Wunsch       │
+              │    alignment on char seqs │
+              │                           │
+              │ 2. Per-position decision: │
+              │    Match → HTML text +    │
+              │             OCR bbox      │
+              │    HTML-only → HTML text  │
+              │               + estimated │
+              │               bbox        │
+              │    OCR-only → OCR text +  │
+              │               OCR bbox    │
+              │               (image-     │
+              │               embedded)   │
+              │    Conflict → confidence- │
+              │               weighted    │
+              │               merge       │
+              │                           │
+              │ 3. Output: ordered        │
+              │    FusionBlock[]          │
+              └──────────┬───────────────┘
+                         ▼
+              ┌──────────────────────────┐
+              │  STRUCTURED DOCUMENT     │
+              │  MODEL (SDM)             │
+              │                          │
+              │ FusionBlocks[]           │
+              │ Tables[]                 │
+              │ Images[]                 │
+              │ Page dimensions          │
+              │ Layout tree              │
+              └──────────┬───────────────┘
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+              ▼                     ▼
+     ┌────────────────┐   ┌────────────────┐
+     │   Chunker       │   │  Metadata Store│
+     │ (geometric:     │   │  (serialized   │
+     │  1024px strips) │   │   SDM per      │
+     │                 │   │   chunk)       │
+     └────────┬───────┘   └────────┬───────┘
+              │                     │
+              ▼                     │
+     ┌────────────────┐            │
+     │   Embedder      │            │
+     │ (text-only /    │            │
+     │  layout-aware / │            │
+     │  hybrid)        │            │
+     │                 │            │
+     │ → vectors       │            │
+     └────────┬───────┘            │
+              │                     │
+              └──────────┬──────────┘
+                         ▼
+              ┌──────────────────────────┐
+              │      FAISS INDEX          │
+              │ (IVFFlat / IVFPQ)         │
+              │ + sidecar metadata        │
+              └──────────┬───────────────┘
+                         │
+                         ▼
+              ┌──────────────────────────┐
+              │  FastAPI SERVE           │
+              │                          │
+              │ POST /search             │
+              │ POST /reconstruct        │
+              │ GET /health              │
+              └──────────────────────────┘
+```
+
+---
+
+## 5. Module Map
+
+```
+mimic-visual/
+│
+├── pyproject.toml              # Project metadata, entry points, extras
+├── visrag.yaml                 # Default configuration
+│
+├── src/visrag/
+│   ├── __init__.py
+│   │
+│   ├── core/                   # Primitive types & schemas
+│   │   ├── __init__.py
+│   │   ├── document.py         # Document, DocumentSource enum
+│   │   ├── render.py           # RenderResult, Tile
+│   │   ├── fusion.py           # FusionBlock, Provenance enum
+│   │   ├── sdm.py              # SDM, Table, ImageRegion
+│   │   ├── chunk.py            # Chunk (SDM slice + y_offset)
+│   │   ├── embedding.py        # EmbeddingVector (typed ndarray wrapper)
+│   │   └── query.py            # SearchQuery, SearchResult
+│   │
+│   ├── sources/                # Document source adapters
+│   │   ├── __init__.py
+│   │   ├── base.py             # AbstractSource
+│   │   ├── web.py              # WebSource: Playwright + CDP
+│   │   ├── pdf.py              # PDFSource: MuPDF / pdf2image
+│   │   ├── local.py            # LocalSource: HTML/image files
+│   │   └── image.py            # ImageSource: standalone images
+│   │
+│   ├── render/                 # Screenshot capture
+│   │   ├── __init__.py
+│   │   ├── base.py             # AbstractRenderer
+│   │   ├── cdp.py              # Direct CDP (Chrome DevTools Protocol)
+│   │   └── playwright.py       # Playwright wrapper
+│   │
+│   ├── extract/                # THE FUSION PIPELINE
+│   │   ├── __init__.py
+│   │   │
+│   │   ├── ocr/                # Pluggable OCR
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py         # AbstractOCREngine
+│   │   │   ├── surya.py        # Surya backend
+│   │   │   ├── doctr.py        # DocTR backend
+│   │   │   └── easyocr.py      # EasyOCR backend
+│   │   │
+│   │   ├── html_parser.py      # HTML → text nodes + DOM tree + styles
+│   │   ├── aligner.py          # Needleman-Wunsch character alignment
+│   │   ├── fusion_engine.py    # Orchestrates HTML+OCR → FusionBlocks
+│   │   ├── table_detector.py   # Table structure from aligned cell grid
+│   │   ├── layout_analyzer.py  # Role classification (heading, paragraph, etc.)
+│   │   └── sdm_builder.py      # FusionBlocks + layout → SDM
+│   │
+│   ├── chunk/                  # Page → Chunks
+│   │   ├── __init__.py
+│   │   ├── base.py             # AbstractChunker
+│   │   └── geometric.py        # Fixed-height chunking (default 1024px)
+│   │
+│   ├── embed/                  # Pluggable embedding
+│   │   ├── __init__.py
+│   │   ├── base.py             # AbstractEmbedder
+│   │   ├── text_only.py        # Serialize text → MiniLM / BGE / SBERT
+│   │   ├── layout_aware.py     # Text + position tokens → small transformer
+│   │   ├── hybrid.py           # Text + visual thumbnail → concatenated vector
+│   │   └── registry.py         # Embedder registry by name
+│   │
+│   ├── index/                  # FAISS index
+│   │   ├── __init__.py
+│   │   ├── base.py             # AbstractIndex
+│   │   ├── faiss_index.py      # FAISS IVFFlat / IVFPQ implementation
+│   │   ├── metadata_store.py   # Sidecar store: chunk_id → SDM + metadata
+│   │   └── builder.py          # Index build orchestrator
+│   │
+│   ├── serve/                  # FastAPI server
+│   │   ├── __init__.py
+│   │   ├── api.py              # App factory
+│   │   ├── routes/
+│   │   │   ├── search.py       # POST /search (text or image query)
+│   │   │   ├── reconstruct.py  # POST /reconstruct (chunk_id → HTML/SVG)
+│   │   │   └── status.py       # GET /health
+│   │   └── query_encoder.py    # Query → embedding (through the same embedder)
+│   │
+│   ├── reconstruct/            # SDM → visual output
+│   │   ├── __init__.py
+│   │   ├── base.py             # AbstractReconstructor
+│   │   ├── html_reconstructor.py  # SDM → styled HTML
+│   │   ├── svg_reconstructor.py   # SDM → SVG layout
+│   │   └── text_reconstructor.py  # SDM → plain text (e.g., for LLM input)
+│   │
+│   └── cli/                    # CLI entry points
+│       ├── __init__.py
+│       ├── main.py             # visrag <command>
+│       ├── render_cmd.py       # visrag render
+│       ├── extract_cmd.py      # visrag extract  (KEY: fusion entry point)
+│       ├── chunk_cmd.py        # visrag chunk
+│       ├── embed_cmd.py        # visrag embed
+│       ├── index_cmd.py        # visrag index (build / info)
+│       ├── serve_cmd.py        # visrag serve
+│       └── recon_cmd.py        # visrag reconstruct
+│
+└── config/
+    ├── __init__.py
+    ├── settings.py             # Pydantic BaseSettings
+    └── defaults.yaml           # Default configuration
+```
+
+---
+
+## 6. The Fusion Engine (Core Algorithm)
+
+### 6.1 Inputs
+
+- **HTML text sequence**: concatenation of all visible text nodes from the DOM, in DOM order, with position metadata per node (`xpath`, `depth`, `bbox_if_known`, `font_size`, `font_weight`, `tag_name`).
+- **OCR region list**: ordered (reading order) list of regions from the image, each with `bbox`, `text`, `confidence`, and optional `reading_order`.
+
+### 6.2 Alignment (Needleman-Wunsch)
+
+Character-level global alignment between the HTML character sequence and the OCR character sequence.
+
+**Scoring:**
+
+| Event | Score |
+|---|---|
+| Match (same character) | +2 |
+| Mismatch (different char) | -1 |
+| Gap in HTML (OCR char with no HTML match) | -1 |
+| Gap in OCR (HTML char with no OCR match) | -1 |
+
+**Alignment interpretation:**
+
+| Pattern | Meaning | Action |
+|---|---|---|
+| HTML char A ↔ OCR char A | Match | FusionBlock with `provenance = fused`, bbox from OCR |
+| HTML char — ↔ OCR char X | HTML gap | Text exists in image only (chart, infographic) → `provenance = ocr`, `is_embedded_image_text = true` |
+| HTML char A ↔ OCR char — | OCR gap | OCR missed it → `provenance = html`, bbox interpolated |
+| HTML char A ↔ OCR char B | Mismatch | Conflict → resolve by confidence (see below) |
+
+### 6.3 Conflict Resolution
+
+When HTML and OCR disagree on text, resolve by confidence:
+
+```python
+def resolve_conflict(html_text: str, ocr_text: str, 
+                     html_conf: float, ocr_conf: float) -> tuple[str, float]:
+    # Character-level: for each aligned position, pick the source
+    # with higher character-level confidence
+    # Or: use longer text if one is a clear substring of the other
+    if html_text.lower() in ocr_text.lower():
+        return ocr_text, max(html_conf, ocr_conf)
+    if ocr_text.lower() in html_text.lower():
+        return html_text, max(html_conf, ocr_conf)
+    # Fall back to confidence-weighted longer text
+    if html_conf > ocr_conf + 0.2:
+        return html_text, html_conf
+    if ocr_conf > html_conf + 0.2:
+        return ocr_text, ocr_conf
+    # Equal confidence → prefer HTML (generally less hallucination)
+    return html_text, (html_conf + ocr_conf) / 2
+```
+
+### 6.4 Fusion Decision Matrix
+
+| HTML has text? | OCR has text? | Alignment quality | Block provenance |
+|---|---|---|---|
+| Yes | Yes | High (match) | `fused_high_conf` — HTML text, OCR bbox |
+| Yes | No | — | `html` — HTML text, interpolate bbox |
+| Yes | Yes | Low (conflict) | `fused_low_conf` — confidence-weighted text |
+| No | Yes | — | `ocr` — OCR text, OCR bbox (image-embedded) |
+| No | No | — | Skip (non-content region) |
+
+### 6.5 Bbox Interpolation (for HTML-only blocks)
+
+When OCR misses a text that exists in HTML, estimate its position:
+
+```python
+def interpolate_bbox(html_node, prev_block, next_block):
+    # Use font metrics from CSS (font-size, line-height, font-family)
+    # to estimate width/height of the missing text block
+    # Place it between the previous and next known bboxes in reading order
+    estimated_y = prev_block.bbox[3] + line_spacing
+    estimated_height = line_height_from_font(html_node.font_size)
+    estimated_x = left_margin_from_context(html_node)
+    estimated_width = measure_text_width(html_node.text, html_node.font_family, 
+                                          html_node.font_size)
+    return (estimated_x, estimated_y, 
+            estimated_x + estimated_width, estimated_y + estimated_height)
+```
+
+---
+
+## 7. Data Schemas
+
+### 7.1 FusionBlock
+
+```python
+@dataclass
+class FusionBlock:
+    text: str                              # Best available text
+    bbox: tuple[float, float, float, float]  # x1, y1, x2, y2 (pixels)
+    provenance: Literal[
+        "fused_high_conf",    # HTML + OCR match
+        "fused_low_conf",     # HTML + OCR conflict, resolved
+        "html",               # HTML only (no OCR)
+        "ocr"                 # OCR only (image-embedded text)
+    ]
+    html_text: str | None                  # Original HTML text
+    ocr_text: str | None                   # Original OCR text
+    html_confidence: float | None          # Alignment match quality (0-1)
+    ocr_confidence: float | None           # OCR engine confidence (0-1)
+    role: Literal[
+        "heading", "paragraph", "list", "list_item", 
+        "table_cell", "image_alt", "caption", "code", "other"
+    ]
+    font_size: float | None                # px (from CSS or OCR estimate)
+    font_weight: Literal["normal", "bold", "lighter", "bolder"] | None
+    text_align: Literal["left", "center", "right", "justify"] | None
+    is_embedded_image_text: bool           # True if only exists in rendered image
+    xpath: str | None                      # DOM path (if from HTML)
+    dom_depth: int | None                  # Nesting depth in DOM tree
+```
+
+### 7.2 Table
+
+```python
+@dataclass
+class TableCell:
+    text: str
+    bbox: tuple[float, float, float, float]
+    row: int
+    col: int
+    rowspan: int
+    colspan: int
+    is_header: bool
+    provenance: str                        # Same as FusionBlock
+
+@dataclass
+class Table:
+    cells: list[TableCell]
+    bbox: tuple[float, float, float, float]
+    caption: str | None
+    row_count: int
+    col_count: int
+```
+
+### 7.3 ImageRegion
+
+```python
+@dataclass
+class ImageRegion:
+    bbox: tuple[float, float, float, float]
+    alt_text: str | None                   # From HTML alt attribute, if available
+    caption: str | None                    # Nearby text identified as caption
+    src: str | None                        # Original image source URL (if from HTML)
+    is_decoration: bool                    # Decorative image (no meaningful content)
+```
+
+### 7.4 Structured Document Model (SDM)
+
+```python
+@dataclass
+class SDM:
+    source_url: str
+    page_width: int                        # Viewport width in pixels
+    page_height: int                       # Full scroll height in pixels
+    blocks: list[FusionBlock]              # In reading order
+    tables: list[Table]                    # Extracted tables
+    images: list[ImageRegion]              # Images with position + alt text
+    layout_tree: dict | None               # Hierarchical layout (nesting structure)
+    language: str | None                   # Detected language
+    metadata: dict                         # Render timestamp, engine versions, etc.
+```
+
+### 7.5 Chunk
+
+```python
+@dataclass
+class Chunk:
+    chunk_id: str                          # Unique hash (content-addressed)
+    document_id: str                       # Maps to source document
+    y_offset: int                          # Top edge position in full page (px)
+    height: int                            # Chunk height (px) — may be <1024 at page end
+    blocks: list[FusionBlock]              # Subset of SDM blocks within this chunk
+    tables: list[Table]                    # Subset of tables intersecting this chunk
+    images: list[ImageRegion]              # Subset of images intersecting this chunk
+    embedding: EmbeddingVector | None      # Populated after embed stage
+```
+
+### 7.6 Search Result
+
+```python
+@dataclass
+class SearchResult:
+    chunk: Chunk                           # Full chunk data for reconstruction
+    score: float                           # Cosine similarity score
+    document_metadata: dict                # Source title, URL, etc.
+```
+
+---
+
+## 8. Pluggable Interfaces
+
+### 8.1 OCREngine
+
+```python
+class OCREngine(ABC):
+    @abstractmethod
+    def detect(
+        self,
+        image: Image.Image,
+        language: str | None = None
+    ) -> list[OCRRegion]:
+        ...
+    
+    @abstractmethod
+    def detect_batch(
+        self,
+        images: list[Image.Image],
+        language: str | None = None,
+        batch_size: int = 8
+    ) -> list[list[OCRRegion]]:
+        ...
+
+@dataclass
+class OCRRegion:
+    bbox: tuple[float, float, float, float]
+    text: str
+    confidence: float
+    reading_order: int | None
+    is_table: bool | None
+```
+
+### 8.2 Embedder
+
+```python
+class Embedder(ABC):
+    @abstractmethod
+    def embed_sdm(self, sdm: SDM) -> np.ndarray:
+        """Returns L2-normalized embedding vector"""
+        ...
+    
+    @abstractmethod
+    def embed_chunk(self, chunk: Chunk) -> np.ndarray:
+        """Encodes a chunk (subset of SDM) for indexing"""
+        ...
+    
+    @abstractmethod
+    def embed_query(self, query: str | Image.Image) -> np.ndarray:
+        """Encodes search queries into the same latent space"""
+        ...
+    
+    @property
+    @abstractmethod
+    def dimension(self) -> int:
+        """Embedding vector dimensionality"""
+        ...
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Unique name for this embedder (used in config/index metadata)"""
+        ...
+```
+
+### 8.3 Reconstructor
+
+```python
+class Reconstructor(ABC):
+    @abstractmethod
+    def reconstruct(self, chunks: list[Chunk], output_format: str) -> str:
+        """Reconstruct chunks into HTML, SVG, or text"""
+        ...
+    
+    @property
+    @abstractmethod
+    def supported_formats(self) -> list[str]:
+        return ["html", "svg", "text"]
+```
+
+---
+
+## 9. Configuration
+
+### 9.1 Default YAML
+
+```yaml
+# visrag.yaml
+source:
+  type: web                              # web | pdf | local | image
+  urls: ./urls.txt
+  # pdf_path: ./docs/
+  # local_path: ./html/
+
+render:
+  engine: cdp                            # cdp | playwright | mupdf
+  tile_height: 8192
+  viewport_width: 875
+  wait_strategy: network_idle            # load | network_idle | manual
+  timeout_seconds: 30
+
+extract:
+  ocr:
+    engine: surya                        # surya | doctr | easyocr
+    language: auto
+    batch_size: 4
+  alignment:
+    method: needleman_wunsch
+    gap_penalty: -1
+    match_bonus: 2
+    mismatch_penalty: -1
+    html_confidence_bonus: 0.1           # Slight preference for HTML on tie
+  table_detection: true
+  layout_analysis: true
+
+chunk:
+  strategy: geometric                    # geometric | semantic
+  chunk_height: 1024
+  overlap_px: 0
+
+embed:
+  model: text-only                       # text-only | layout-aware | hybrid
+  model_name: BAAI/bge-small-en-v1.5
+  device: cpu                            # cpu | cuda
+  batch_size: 32
+  max_seq_length: 512
+
+index:
+  type: faiss
+  metric: cosine
+  nlist: auto                            # auto | int
+  nprobe: 128
+  pq: false                              # Enable Product Quantization for compression
+  pq_m: 64                               # PQ sub-vectors (if enabled)
+
+serve:
+  host: 0.0.0.0
+  port: 30001
+  reconstruct: true
+  max_results: 20
+  cors_origins: ["*"]
+
+reconstruct:
+  default_format: html
+  include_metadata: true
+  inline_styles: true
+```
+
+---
+
+## 10. CLI Commands
+
+```bash
+# Render: capture screenshots + HTML from documents
+visrag render <url_or_path> --output ./pages
+
+# Extract: OCR → align → fuse → build SDM (THE CORE COMMAND)
+visrag extract ./pages --ocr-engine surya
+
+# Chunk: split SDMs into fixed-height slices
+visrag chunk ./pages --height 1024
+
+# Embed: encode chunks into vectors
+visrag embed ./pages --model text-only
+
+# Build index: create FAISS index + metadata store
+visrag index build --input ./pages --output ./index
+
+# Serve: start the search API
+visrag serve --index-dir ./index
+
+# Reconstruct: rebuild HTML/SVG from a chunk ID
+visrag reconstruct <chunk_id> --format html
+
+# Info: inspect an index or SDM
+visrag index info --index-dir ./index
+```
+
+---
+
+## 11. File Layout (Runtime)
+
+```
+./pages/                                    # Output from 'visrag render'
+├── page_001/                               # One directory per document
+│   ├── tiles.json                          # Render manifest
+│   ├── tile_0000.jpg                       # Screenshot tiles (8192px each)
+│   ├── tile_0001.jpg
+│   ├── ...
+│   ├── source.html                         # Original HTML (may be empty)
+│   └── source.meta.json                    # Source metadata (title, URL, etc.)
+│
+├── page_001.extract/                       # Output from 'visrag extract'
+│   ├── sdm.json                            # Full Structured Document Model
+│   └── fusion_report.json                  # Provenance stats per block
+│
+├── page_001.chunks/                        # Output from 'visrag chunk'
+│   ├── chunks.json                         # Chunk manifest
+│   ├── chunk_0000.json                     # SDM slice + position
+│   ├── chunk_0001.json
+│   └── ...
+│
+├── page_001.embeddings/                    # Output from 'visrag embed'
+│   ├── embeddings.npz                      # chunk_id → vector
+│   └── embedder_meta.json                  # Model name, dimension, etc.
+│
+└── articles.json                           # Document index (title, URL, id)
+
+./index/                                    # Output from 'visrag index build'
+├── index.faiss                             # FAISS index file
+├── metadata_store/                         # Sidecar: chunk_id → SDM
+│   ├── chunk_0000.sdm.msgpack
+│   ├── chunk_0001.sdm.msgpack
+│   └── ...
+├── summary.json                            # Index statistics
+└── config.yaml                             # Snapshot of build config
+```
+
+---
+
+## 12. API Endpoints
+
+### POST /search
+
+Search by text or image query. Returns chunks ranked by similarity.
+
+```json
+// Request
+{
+  "query": {
+    "text": "What is the capital of France?",
+    "image": null                              // Optional base64-encoded image
+  },
+  "n_results": 10,
+  "include_sdm": true                          // Return full SDM in results
+}
+
+// Response
+{
+  "results": [
+    {
+      "chunk_id": "abc123",
+      "document_id": "doc_001",
+      "document_url": "https://en.wikipedia.org/wiki/France",
+      "score": 0.91,
+      "sdm": { ... },                          // Full chunk SDM
+      "y_offset": 3420,
+      "height": 1024
+    }
+  ],
+  "query_time_ms": 45
+}
+```
+
+### POST /reconstruct
+
+Reconstruct a chunk (or set of chunks) into a renderable format.
+
+```json
+// Request
+{
+  "chunk_ids": ["abc123", "abc124"],
+  "format": "html",                            // html | svg | text
+  "options": {
+    "inline_styles": true,
+    "include_images": false
+  }
+}
+
+// Response
+{
+  "format": "html",
+  "content": "<!DOCTYPE html>...",             // Reconstructed document
+  "chunk_count": 2,
+  "coverage_px": 2048
+}
+```
+
+### GET /health
+
+```json
+{
+  "status": "ok",
+  "index_size": 500000,
+  "embedder": "text-only/BAAI/bge-small-en-v1.5",
+  "index_dimension": 384,
+  "uptime_seconds": 86400
+}
+```
+
+---
+
+## 13. Development Phases
+
+### Phase 1 — Core Fusion Loop
+
+**Goal:** End-to-end fusion for a single document via CLI.
+
+- Core schemas (`core/`)
+- Web renderer (Playwright or CDP, `render/`)
+- Surya OCR backend (`extract/ocr/`)
+- HTML parser (`extract/html_parser.py`)
+- Needleman-Wunsch aligner (`extract/aligner.py`)
+- Fusion engine → FusionBlocks (`extract/fusion_engine.py`)
+- SDM builder + serialization (`extract/sdm_builder.py`)
+- CLI: `visrag render`, `visrag extract`
+
+**Deliverable:** `visrag extract ./pages` produces `sdm.json` with correct text+bbox fusion.
+
+---
+
+### Phase 2 — Chunking + Embedding + Index
+
+**Goal:** Build a searchable vector index.
+
+- Geometric chunker (`chunk/`)
+- Text-only embedder via sentence-transformers (`embed/text_only.py`)
+- FAISS IVFFlat index (`index/faiss_index.py`)
+- Metadata store (sidecar per chunk) (`index/metadata_store.py`)
+- Index builder orchestrator (`index/builder.py`)
+- CLI: `visrag chunk`, `visrag embed`, `visrag index build`
+
+**Deliverable:** `visrag index build --input ./pages --output ./index` produces a searchable FAISS index.
+
+---
+
+### Phase 3 — Serve + Reconstruct
+
+**Goal:** FastAPI API with search and reconstruction endpoints.
+
+- FastAPI application (`serve/api.py`)
+- `/search` route — embed query, search FAISS, return SDM results
+- Query encoder (`serve/query_encoder.py`)
+- HTML reconstructor — SDM → styled HTML (`reconstruct/html_reconstructor.py`)
+- Text reconstructor — SDM → plain text for LLM consumption
+- CLI: `visrag serve`, `visrag reconstruct`
+
+**Deliverable:** Running API server with search and full document reconstruction.
+
+---
+
+### Phase 4 — Quality + Scale
+
+**Goal:** Better retrieval quality and larger corpora.
+
+- Layout analyzer — heading detection, column detection, role classification
+- Table detector + table reconstruction
+- Alternative OCR backends (DocTR, EasyOCR)
+- Layout-aware embedder (text + position tokens)
+- Hybrid embedder (text + visual thumbnail via tiny CNN)
+- SVG reconstructor
+- Sharded FAISS for multi-machine index
+- Multi-GPU embedding batch pipeline
+
+---
+
+## 14. Open Questions for Future Design
+
+- Should the FAISS index use **IVFFlat** (higher recall, larger index) or **IVFPQ** (compressed, faster, slight recall loss)?
+- Should chunking be purely **geometric** (fixed height) or **semantic** (split at paragraph/heading boundaries)?
+- For reconstruction fidelity: should the SDM store **exact font families/colors** from CSS, or is structural layout sufficient?
+- Should the alignment be **character-level Needleman-Wunsch** or **token-level** (word/subword) for efficiency?
+- How should overlapping/conflicting bboxes from OCR be resolved? (Merge, pick highest confidence, or keep separate?)

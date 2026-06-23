@@ -1,0 +1,60 @@
+# visrag.yaml — Default configuration for Mimic-Visual
+
+source:
+  type: web
+  urls: ./urls.txt
+  # pdf_path: ./docs/
+  # local_path: ./html/
+
+render:
+  engine: cdp
+  tile_height: 8192
+  viewport_width: 875
+  wait_strategy: network_idle
+  timeout_seconds: 30
+
+extract:
+  ocr:
+    engine: surya
+    language: auto
+    batch_size: 4
+  alignment:
+    method: needleman_wunsch
+    gap_penalty: -1
+    match_bonus: 2
+    mismatch_penalty: -1
+    html_confidence_bonus: 0.1
+  table_detection: true
+  layout_analysis: true
+
+chunk:
+  strategy: geometric
+  chunk_height: 1024
+  overlap_px: 0
+
+embed:
+  model: text-only
+  model_name: BAAI/bge-small-en-v1.5
+  device: cpu
+  batch_size: 32
+  max_seq_length: 512
+
+index:
+  type: faiss
+  metric: cosine
+  nlist: 128
+  nprobe: 128
+  pq: false
+  pq_m: 64
+
+serve:
+  host: 0.0.0.0
+  port: 30001
+  reconstruct: true
+  max_results: 20
+  cors_origins: ["*"]
+
+reconstruct:
+  default_format: html
+  include_metadata: true
+  inline_styles: true

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "visrag"
+version = "0.1.0"
+description = "Visual document retrieval and reconstruction system"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pyyaml>=6.0",
+    "numpy>=1.24",
+    "Pillow>=10.0",
+    "faiss-cpu>=1.7",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "httpx>=0.24",
+    "click>=8.1",
+    "rich>=13.0",
+    "msgpack>=1.0",
+]
+
+[project.optional-dependencies]
+render = ["playwright>=1.40"]
+ocr-surya = ["surya-ocr>=0.4"]
+ocr-doctr = ["python-doctr>=0.7"]
+ocr-easyocr = ["easyocr>=1.7"]
+embed = ["sentence-transformers>=2.2"]
+all = [
+    "visrag[render,ocr-surya,ocr-doctr,ocr-easyocr,embed]",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+visrag = "visrag.cli.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/visrag"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]

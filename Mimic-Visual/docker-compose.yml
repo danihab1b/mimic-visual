@@ -1,0 +1,87 @@
+# ===========================================================================
+# docker-compose.yml — Mimic-Visual services
+#
+# Services:
+#   api       — Search/reconstruct API server (production)
+#   pipeline  — One-shot CLI pipeline (render -> extract -> chunk -> embed -> index)
+#   dev       — Development shell with hot-reload
+#
+# Usage:
+#   docker compose up api                    # Start API server
+#   docker compose run pipeline              # Run full pipeline
+#   docker compose run pipeline render ...   # Run single CLI command
+#   docker compose run dev                   # Dev shell
+# ===========================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # API Server — search + reconstruct endpoints
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      target: production
+    container_name: visrag-api
+    ports:
+      - "${PORT:-30001}:30001"
+    volumes:
+      - ./visrag.yaml:/app/visrag.yaml:ro
+      - index-data:/app/index
+      - pages-data:/app/pages
+    environment:
+      - VISRAG_CONFIG=/app/visrag.yaml
+      - INDEX_DIR=/app/index
+      - HOST=0.0.0.0
+      - PORT=30001
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Pipeline — run the full ingest pipeline as a one-shot container
+  # ---------------------------------------------------------------------------
+  pipeline:
+    build:
+      context: .
+      target: production
+    container_name: visrag-pipeline
+    volumes:
+      - ./visrag.yaml:/app/visrag.yaml:ro
+      - ./pages:/app/pages
+      - ./index:/app/index
+    environment:
+      - VISRAG_CONFIG=/app/visrag.yaml
+    profiles:
+      - pipeline
+
+  # ---------------------------------------------------------------------------
+  # Dev — development shell with source mounted for live editing
+  # ---------------------------------------------------------------------------
+  dev:
+    build:
+      context: .
+      target: deps
+    container_name: visrag-dev
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./src:/app/src
+      - ./visrag.yaml:/app/visrag.yaml
+      - ./pages:/app/pages
+      - ./index:/app/index
+    environment:
+      - VISRAG_CONFIG=/app/visrag.yaml
+      - PYTHONPATH=/app/src
+    entrypoint: ["bash"]
+    profiles:
+      - dev
+
+volumes:
+  index-data:
+    driver: local
+  pages-data:
+    driver: local
